@@ -1,5 +1,8 @@
 # SSA gap filling for GRACE / GRACE-FO
 
+For one monthly text file per country from the filled output, see
+[Country extraction](COUNTRY_EXTRACTION.md) and `extract_countries.py`.
+
 This package adapts your `ssa_missing_iterative.m`, `fun_SSA_filling_a.m`, and
 `fun_SSA_filling_b.m` to Python. It processes one monthly time series at each
 spatial location, with bounded spatial chunks. It works with grids or mascon
