@@ -7,7 +7,7 @@ import pytest
 import xarray as xr
 from threadpoolctl import threadpool_limits
 
-from ssa_gapfill import ssa_fill, fill_series, monthly_axis, select_parameters, process_series
+from ssa_gapfill import ssa_fill, fill_series, monthly_axis, select_parameters, process_series, process_block
 
 
 @pytest.fixture(autouse=True)
@@ -213,3 +213,57 @@ def test_endpoint_netcdf_cli(tmp_path):
         assert out.lwe_thickness_ssa_forward_holdout_rmse.item() < 0.01
         assert out.lwe_thickness_ssa_backward_holdout_rmse.item() < 0.01
         assert np.isnan(out.lwe_thickness.values[:3]).all()
+
+
+def test_block_deduplication_preserves_all_results(monkeypatch):
+    import ssa_gapfill as module
+    time = 2002 + (np.arange(120)+0.5)/12
+    rows = np.tile(signal(120),(2,3,1))
+    rows[:,:,40:43] = np.nan
+    rows[0,1] += 0.5
+    rows[1,1,:] = np.nan
+    # Almost-equal series must remain distinct.
+    rows[1,2,20] += 1e-10
+    options = dict(window=24,rank=5,two_stage=False)
+    calls = []
+    original = module.process_series
+    def record(*args,**kwargs):
+        calls.append(1)
+        return original(*args,**kwargs)
+    monkeypatch.setattr(module,'process_series',record)
+    baseline = process_block(time,rows,deduplicate=False,**options)
+    assert len(calls) == 6
+    calls.clear()
+    optimized = process_block(time,rows,deduplicate=True,**options)
+    assert len(calls) == 4
+    for expected,actual in zip(baseline,optimized):
+        np.testing.assert_array_equal(actual,expected)
+
+
+def test_process_executor_matches_threads_netcdf(tmp_path):
+    rows = np.tile(signal(120)[:,None,None],(1,2,3))
+    rows[40:43,:,:] = np.nan
+    rows[:3,:,:] = np.nan
+    rows[-4:,:,:] = np.nan
+    rows[:,1,0] += 1
+    rows[:,1,1] = np.nan
+    ds = xr.Dataset({'lwe_thickness':(('time','lat','lon'),rows)},
+                    coords={'time':xr.date_range('2002-01-01',periods=120,freq='MS'),
+                            'lat':[1,2], 'lon':[1,2,3]})
+    source=tmp_path/'source.nc'
+    ds.to_netcdf(source)
+    paths = []
+    for executor in ['threads','processes']:
+        output = tmp_path/(executor+'.nc')
+        paths.append(output)
+        command = [sys.executable,str(Path(__file__).with_name('ssa_gapfill.py')),
+            str(source),str(output),'--variable','lwe_thickness','--extrapolate',
+            '--validate-endpoints','--window','24','--rank','5','--single-stage',
+            '--executor',executor,'--workers','2','--spatial-chunk','2','--batch-size','1']
+        if executor == 'threads':
+            command.append('--no-deduplicate')
+        result = subprocess.run(command,capture_output=True,text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+    with xr.open_dataset(paths[0]) as a, xr.open_dataset(paths[1]) as b:
+        for name in a.variables:
+            np.testing.assert_array_equal(a[name].values,b[name].values)

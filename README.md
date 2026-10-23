@@ -121,13 +121,64 @@ with xr.open_dataset('input.nc') as ds:
 Use dimension names appropriate to your file. `--spatial-chunk 8` (default)
 limits each spatial dimension's chunk size, while retaining the entire time
 series per task. Default `--workers 1` avoids oversubscribing CPU libraries.
-More workers can help, but the full MATLAB parameter search at every grid cell
-can be very expensive. Test timing and reconstruction quality on representative
-land cells before scaling up. Permanently masked all-NaN cells remain NaN.
+For multiple CPUs use the process executor described below; the default thread
+executor can scale poorly on Python loops. The full MATLAB parameter search at
+every grid cell can be very expensive. Test timing and reconstruction quality on
+representative land cells before scaling up. Permanently masked all-NaN cells remain NaN.
 The filled float64 array alone would occupy about 2.43 GB uncompressed for your
 293x720x1440 grid, in addition to the retained input variable and diagnostics.
 The actual NetCDF size depends on compression. Many displayed grid pixels may
 represent the same native mascon; this code processes grid cells independently.
+
+## Faster execution on Derecho
+
+Update the repository first with `git pull --ff-only` (or replace the script from
+the latest GitHub ZIP). The updated implementation adds:
+
+- `--executor processes`: a persistent pool of independent Python processes,
+  each with one BLAS thread. The parent reads and writes NetCDF; workers receive
+  only NumPy arrays, so HDF5 handles are not shared across processes.
+- Exact reuse within each spatial tile, enabled by default. Only bitwise-identical
+  complete time series with identical missing patterns share a result. No rounding,
+  approximate matching, or inferred mascon membership is used. Output observations,
+  flags, convergence status, and diagnostics remain unchanged. `--no-deduplicate`
+  disables this optimization for comparison.
+- `--batch-size`: number of distinct series sent in each process task (default 8).
+  Smaller batches expose more parallel work but increase communication overhead.
+
+The previous thread-based command is still supported. Changing just `--workers`
+to 64 does not activate process execution.
+
+In a compute allocation with at least 32 CPU cores, benchmark a 32x32 tile first:
+
+```bash
+time python ssa_gapfill.py "../CSR_GRACE_GRACE-FO_RL0603_Mascons_Jan2002_Dec2026_FillNaN.nc" CSR_SSA_process_pilot.nc --variable lwe_thickness --extrapolate --max-extrapolation 4 --executor processes --workers 32 --spatial-chunk 32 --batch-size 1 --isel lat=300:332 --isel lon=300:332
+```
+
+Use your actual directory and select representative cells with observations.
+For a full-grid run after checking the pilot:
+
+```bash
+python -u ssa_gapfill.py "../CSR_GRACE_GRACE-FO_RL0603_Mascons_Jan2002_Dec2026_FillNaN.nc" CSR_SSA_process_full.nc --variable lwe_thickness --extrapolate --max-extrapolation 4 --executor processes --workers 32 --spatial-chunk 32 --batch-size 1
+```
+
+Do not exceed the CPUs allocated by PBS. A larger tile can expose more distinct
+series to workers, while consuming more parent memory. Exact repetitions reduce
+work but can also leave fewer distinct tasks than available workers. Only one
+spatial tile is submitted at a time in process mode. It runs on one node; there
+is no MPI distribution or checkpoint/resume support. Run on a compute node,
+stop the previous run before replacing it, and choose a new output filename.
+
+Endpoint validation is omitted in these production examples to avoid two extra
+fits per location. Run `--validate-endpoints` on representative pilot regions;
+omitting validation changes diagnostic availability, not the filled estimates.
+
+A controlled synthetic 256-cell benchmark (300 months, 16 distinct series each
+repeated 16 times, one BLAS thread, same SSA settings and endpoint estimation)
+took 12.258 seconds without reuse and 0.708 seconds with reuse. All output arrays
+were identical. This measures duplicate reuse, not process scaling, and is not a
+forecast of Derecho performance. The actual dataset may have fewer exact repeats.
+Process and thread NetCDF paths are tested for identical variable values.
 
 ## Method and differences from MATLAB
 
@@ -272,7 +323,8 @@ observed-value preservation, all-NaN masks, zeros, endpoints, failed convergence
 blocked-year CV, calendar regularization, nonstandard calendars, and actual
 NetCDF CLI round trips. Endpoint tests include a known seasonal signal plus
 trend, independent holdout refits, horizon limits, nonconvergence, and
-separate backward/forward flags. They do not establish accuracy on your GRACE dataset.
+separate backward/forward flags, exact duplicate reuse, near-equal series kept
+distinct, and multi-process NetCDF equivalence. They do not establish accuracy on your GRACE dataset.
 
 Your `example_C305.mat` has only a 300x1 `ser` time array, rather than a two-column
 time/value series. Your two uploaded text files contain year/month pairs only.

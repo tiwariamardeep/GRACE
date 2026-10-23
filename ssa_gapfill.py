@@ -6,12 +6,61 @@ Only missing samples are replaced. No spatial interpolation is performed.
 from __future__ import annotations
 
 import argparse
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 from scipy.linalg import svd
+
+
+_PROCESS_POOL = None
+_WORKER_THREAD_LIMIT = None
+
+
+def _initialize_worker():
+    # Spawned processes need their own BLAS limits; parent limits do not
+    # reliably propagate through the spawn start method.
+    from threadpoolctl import threadpool_limits
+    global _WORKER_THREAD_LIMIT
+    _WORKER_THREAD_LIMIT = threadpool_limits(limits=1)
+
+
+def _process_batch(time, series, options):
+    return [process_series(time, row, **options) for row in series]
+
+
+def process_block(time, data, batch_size=8, deduplicate=True, **options):
+    """Process a spatial tile, reusing results for bitwise-identical series.
+
+    No near-equality grouping or inferred mascon membership is used. Workers
+    receive NumPy arrays only; all NetCDF access stays in the parent process.
+    """
+    shape = data.shape[:-1]
+    rows = np.ascontiguousarray(data, dtype=np.float64).reshape(-1, data.shape[-1])
+    if deduplicate:
+        rows = rows.copy()
+        rows[np.isnan(rows)] = np.nan  # canonical NaN payload for comparison
+        keys = rows.view(np.dtype((np.void, rows.shape[1]*rows.dtype.itemsize))).ravel()
+        _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
+        unique = rows[first]
+        inverse = inverse.reshape(-1)
+    else:
+        unique, inverse = rows, np.arange(len(rows))
+    batches = [unique[i:i+batch_size] for i in range(0, len(unique), batch_size)]
+    if _PROCESS_POOL is None:
+        results = [result for batch in batches for result in _process_batch(time, batch, options)]
+    else:
+        futures = [_PROCESS_POOL.submit(_process_batch, time, batch, options) for batch in batches]
+        results = [result for future in futures for result in future.result()]
+    output = []
+    dtypes = [np.float64, np.int8, np.int8, np.int16, np.int16, np.float64, np.float64, np.float64]
+    for j, dtype in enumerate(dtypes):
+        column = np.asarray([r[j] for r in results], dtype=dtype)[inverse]
+        output.append(column.reshape(shape + ((rows.shape[1],) if j < 2 else ())))
+    return tuple(output)
 
 
 @dataclass
@@ -288,6 +337,20 @@ def monthly_axis(ds, time_name, regularize=False):
 
 
 def run_netcdf(args):
+    global _PROCESS_POOL
+    if args.executor == 'processes':
+        with ProcessPoolExecutor(max_workers=args.workers,
+                                 mp_context=multiprocessing.get_context('spawn'),
+                                 initializer=_initialize_worker) as pool:
+            _PROCESS_POOL = pool
+            try:
+                return _run_netcdf(args)
+            finally:
+                _PROCESS_POOL = None
+    return _run_netcdf(args)
+
+
+def _run_netcdf(args):
     import dask
     import xarray as xr
     from dask.diagnostics import ProgressBar
@@ -324,12 +387,13 @@ def run_netcdf(args):
                        min_observations=args.min_observations, cv=args.cv,
                        tolerance=args.tolerance, max_iterations=args.max_iterations,
                        extrapolate=args.extrapolate, max_extrapolation=args.max_extrapolation,
-                       validate_endpoints=args.validate_endpoints)
+                       validate_endpoints=args.validate_endpoints,
+                       batch_size=args.batch_size, deduplicate=not args.no_deduplicate)
         values, flags, status, m, k, rmse, backward_rmse, forward_rmse = xr.apply_ufunc(
-            process_series, time, data,
+            process_block, time, data,
             input_core_dims=[[args.time], [args.time]],
             output_core_dims=[[args.time], [args.time], [], [], [], [], [], []],
-            vectorize=True, dask='parallelized', kwargs=options,
+            vectorize=False, dask='parallelized', kwargs=options,
             output_dtypes=[np.float64, np.int8, np.int8, np.int16, np.int16, np.float64, np.float64, np.float64])
         prefix = args.variable + '_ssa'
         names = [prefix, prefix+'_flag', prefix+'_status', prefix+'_window', prefix+'_rank', prefix+'_cv_rmse',
@@ -348,6 +412,8 @@ def run_netcdf(args):
             ssa_min_observations=args.min_observations,
             ssa_extrapolate=int(args.extrapolate), ssa_max_extrapolation=args.max_extrapolation,
             ssa_validate_endpoints=int(args.validate_endpoints),
+            ssa_executor=args.executor, ssa_workers=args.workers,
+            ssa_exact_deduplication=int(not args.no_deduplicate),
             comment='Observed samples preserved. Flags 4/5 are endpoint estimates, not observations; inspect holdout diagnostics.')
         out[names[1]] = flags.transpose(*data.dims)
         out[names[1]].attrs.update(flag_values=np.arange(6,dtype=np.int8),
@@ -382,9 +448,13 @@ def run_netcdf(args):
         temporary = destination.with_name(destination.name + '.partial')
         if temporary.exists():
             raise ValueError(f'Remove or rename stale temporary output first: {temporary}')
-        print(f'Processing {dict(data.sizes)}; output: {destination}', flush=True)
+        print(f'Processing {dict(data.sizes)}; executor={args.executor}, workers={args.workers}; output: {destination}', flush=True)
         try:
-            with threadpool_limits(limits=1), dask.config.set(scheduler='threads', num_workers=args.workers), ProgressBar():
+            # Process mode schedules one spatial tile in the parent at a time;
+            # its batches run in the persistent pool. HDF5 handles never cross
+            # processes. Thread mode preserves the previous scheduler option.
+            parent_workers = 1 if args.executor == 'processes' else args.workers
+            with threadpool_limits(limits=1), dask.config.set(scheduler='threads', num_workers=parent_workers), ProgressBar():
                 out.to_netcdf(temporary, engine='netcdf4', encoding=encoding)
             temporary.rename(destination)
         except BaseException:
@@ -420,6 +490,10 @@ def main():
     p.add_argument('--max-iterations', type=int, default=10000)
     p.add_argument('--spatial-chunk', type=int, default=8)
     p.add_argument('--workers', type=int, default=1)
+    p.add_argument('--executor', choices=['threads', 'processes'], default='threads',
+                   help='Use processes to avoid Python thread contention; request matching CPUs')
+    p.add_argument('--batch-size', type=int, default=8, help='Series per process task (default 8)')
+    p.add_argument('--no-deduplicate', action='store_true', help='Disable reuse for exactly identical series within each tile')
     p.add_argument('--isel', action='append', default=[], metavar='DIM=START:STOP',
                    help='Process only an index subset; repeat for multiple spatial dimensions (stop excluded)')
     args = p.parse_args()
@@ -427,7 +501,7 @@ def main():
         p.error('max-extrapolation must be positive')
     if args.validate_endpoints and not args.extrapolate:
         p.error('--validate-endpoints requires --extrapolate')
-    if args.workers < 1 or args.spatial_chunk < 1 or args.min_observations < 2:
+    if args.workers < 1 or args.spatial_chunk < 1 or args.batch_size < 1 or args.min_observations < 2:
         p.error('workers/chunks must be positive and min-observations >= 2')
     if args.window < 2 or args.rank < 1 or args.rank > args.window:
         p.error('Require window >= 2 and 1 <= rank <= window')
