@@ -1,0 +1,6 @@
+numpy>=1.26
+scipy>=1.11
+xarray>=2024.1
+netCDF4>=1.6
+dask[array]>=2024.1
+threadpoolctl>=3.2
