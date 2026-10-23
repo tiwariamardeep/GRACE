@@ -4,7 +4,8 @@ This package adapts your `ssa_missing_iterative.m`, `fun_SSA_filling_a.m`, and
 `fun_SSA_filling_b.m` to Python. It processes one monthly time series at each
 spatial location, with bounded spatial chunks. It works with grids or mascon
 dimensions, provided the chosen variable contains a decoded `time` dimension.
-Python 3.10+ is recommended.
+Python 3.12 is recommended, particularly on Windows where newer Python
+versions may lack precompiled dependency wheels.
 
 ## Install on Windows
 
@@ -12,13 +13,16 @@ Download and extract this package. Open its folder in File Explorer, click the
 address bar, type `cmd`, and press Enter. In that Command Prompt run:
 
 ```bat
-py -m venv .venv
+py -3.12 -m venv .venv
 .venv\Scripts\activate
 python -m pip install -r requirements.txt
 python demo.py
 ```
 
 If `py` is not found, install Python from https://www.python.org/downloads/ first.
+If the launcher reports no Python 3.12 runtime, install Python 3.12 first; the
+Windows Python install manager supports `py install 3.12`. Stop after any failed
+command rather than continuing with a different Python version.
 The demo creates `demo_input.nc` and `demo_filled.nc` and prints a reconstruction
 error for a known synthetic seasonal signal. These are not real GRACE data.
 Rename/delete the demo files if you want to repeat the demo.
@@ -149,8 +153,59 @@ the MATLAB settings. Values are scaled internally to avoid problems with very
 small magnitudes. This implementation handles a zero convergence denominator,
 uses an economy SVD, and explicitly reports convergence. A stage A failure falls
 back to stage B. Nonconverged stage B estimates are not written as filled data.
-Unknown leading/trailing values are deliberately left missing; no extrapolation
-is attempted. At least 24 observed samples are required by default.
+Unknown leading/trailing values are left missing by default. The optional
+endpoint procedure below estimates them explicitly. At least 24 observed
+samples are required by default.
+
+## Estimate exterior months: optional SSA extrapolation
+
+First prepare an input file with one record for each month from January 2002 to
+December 2026, with NaNs at absent months. The input must preserve the separate
+CSR special-month solutions (November 2011 and May 2015), rather than averaging
+their representative timestamps into October/April. This script cannot recover
+observations previously averaged together.
+
+Update `ssa_gapfill.py` from this repository, then run a pilot:
+
+```bash
+python ssa_gapfill.py "../CSR_GRACE_GRACE-FO_RL0603_Mascons_Jan2002_Dec2026_FillNaN.nc" CSR_SSA_endpoint_pilot.nc --variable lwe_thickness --extrapolate --max-extrapolation 4 --validate-endpoints --isel lat=300:302 --isel lon=300:302
+```
+
+Adjust the input path to the actual file location. After examining the pilot,
+remove the two `--isel` arguments and use a new output filename for the full grid:
+
+```bash
+python ssa_gapfill.py "../CSR_GRACE_GRACE-FO_RL0603_Mascons_Jan2002_Dec2026_FillNaN.nc" CSR_SSA_Jan2002_Dec2026_full.nc --variable lwe_thickness --extrapolate --max-extrapolation 4 --validate-endpoints
+```
+
+`--extrapolate` runs an additional iterative low-rank SSA completion after
+interior filling. Only unknown endpoints are assigned; interior results and
+observations stay fixed. This is iterative SSA extrapolation, not a recurrent
+SSA forecasting algorithm. Backward estimates get flag 4 and forward estimates
+get flag 5. For a series observed from April 2002 to August 2026, it estimates
+the three preceding and four following months. All-NaN locations remain missing.
+
+`--max-extrapolation 4` permits at most four exterior months on each side. Each
+side is checked independently. Longer exterior masks remain NaN instead of
+being extended arbitrarily. The default limit is 12 months. This limit applies
+to endpoint gaps only, not the internal GRACE/GRACE-FO mission gap.
+
+`--validate-endpoints` runs additional independent, single-stage SSA fits to
+the raw series with the same number of months withheld at either end of its
+observed span. Predictions are compared only with genuinely measured holdout
+values. This checks the extrapolation method without using previously filled
+values as validation truth. Parameters are the selected/configured M/K; this is
+a diagnostic, not an independent parameter search or a confidence interval.
+The two saved RMSE variables are in the data's physical units. NaN means the
+diagnostic was not requested, insufficient observations were available, or its
+fit failed to converge. Validation failure does not automatically reject an
+otherwise converged extrapolation; inspect the diagnostics before analysis.
+
+The extra endpoint fits increase runtime. A written file or successful
+convergence does not establish accurate extrapolation. Check endpoint holdout
+RMSE, trend/seasonal plausibility, and the flags on representative land cells.
+Original values remain in the original variable. Missing values elsewhere in
+the dataset, including original-observation timestamp variables, are retained.
 
 This is a methodological adaptation, not a numerical-equivalence certification.
 The MATLAB EOF periodogram flag and residual-based `verror` are not reproduced;
@@ -172,16 +227,18 @@ For an input variable `lwe_thickness`, the additions are:
 | Variable | Meaning |
 | --- | --- |
 | `lwe_thickness_ssa` | Filled data; finite observed values unchanged |
-| `lwe_thickness_ssa_flag` | 0 observed, 1 stage A fill, 2 stage B fill, 3 still missing |
-| `lwe_thickness_ssa_status` | Per-location status: 0 no gaps, 1 success, 2 insufficient data or unknown endpoints, 3 nonconvergence, 4 CV failure |
+| `lwe_thickness_ssa_flag` | 0 observed, 1 stage A fill, 2 stage B fill, 3 still missing, 4 backward extrapolation, 5 forward extrapolation |
+| `lwe_thickness_ssa_status` | Per-location status: 0 no gaps, 1 success, 2 insufficient data or unknown endpoints, 3 nonconvergence, 4 CV failure, 5 endpoint nonconvergence |
 | `lwe_thickness_ssa_window` | Stage B window, 0 if not selected |
 | `lwe_thickness_ssa_rank` | Stage B rank, 0 if not selected |
 | `lwe_thickness_ssa_cv_rmse` | CV RMSE in original units; NaN when CV was not run |
+| `lwe_thickness_ssa_backward_holdout_rmse` | Withheld-start diagnostic RMSE; NaN if unavailable/not requested |
+| `lwe_thickness_ssa_forward_holdout_rmse` | Withheld-end diagnostic RMSE; NaN if unavailable/not requested |
 
 Window/rank describe the configured stage B values even when stage A filled all
 interior gaps. Read flags to identify which stage actually supplied a value.
 An exit code of zero means the file was written, not that every series could be
-filled. The command prints status counts; inspect statuses 2, 3, and 4 and the
+filled. The command prints status counts; inspect statuses 2, 3, 4, and 5 and the
 remaining-NaN mask before analysis. File history and attributes record settings.
 
 ## Use from Python
@@ -200,6 +257,8 @@ if result.converged:
 `ssa_fill` returns estimates even if convergence fails so API users can diagnose
 them; always check `result.converged`. The NetCDF workflow leaves failed gaps
 missing. `fill_series()` supplies the two-stage workflow and flags.
+`process_series()` adds optional endpoint estimation and returns the six
+`fill_series()` outputs followed by backward and forward holdout RMSE.
 
 ## Validation
 
@@ -210,8 +269,10 @@ python -m pytest -q
 
 Tests exercise known seasonal signals, short and 11-month gaps, two-stage flags,
 observed-value preservation, all-NaN masks, zeros, endpoints, failed convergence,
-blocked-year CV, calendar regularization, nonstandard calendars, and an actual
-NetCDF CLI round trip. They do not establish accuracy on your GRACE dataset.
+blocked-year CV, calendar regularization, nonstandard calendars, and actual
+NetCDF CLI round trips. Endpoint tests include a known seasonal signal plus
+trend, independent holdout refits, horizon limits, nonconvergence, and
+separate backward/forward flags. They do not establish accuracy on your GRACE dataset.
 
 Your `example_C305.mat` has only a 300x1 `ser` time array, rather than a two-column
 time/value series. Your two uploaded text files contain year/month pairs only.

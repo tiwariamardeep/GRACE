@@ -7,7 +7,7 @@ import pytest
 import xarray as xr
 from threadpoolctl import threadpool_limits
 
-from ssa_gapfill import ssa_fill, fill_series, monthly_axis, select_parameters
+from ssa_gapfill import ssa_fill, fill_series, monthly_axis, select_parameters, process_series
 
 
 @pytest.fixture(autouse=True)
@@ -147,3 +147,69 @@ def test_csr_header_subset_and_absent_month(tmp_path):
         assert np.isnan(out.lwe_thickness.values[190]).all()
         assert np.isfinite(out.lwe_thickness_ssa.values[190]).all()
         assert np.isfinite(out.lwe_thickness_ssa_cv_rmse.values).all()
+
+
+def test_endpoint_extrapolation_and_independent_holdouts():
+    truth = signal(300) + 0.003*np.arange(300)
+    x = truth.copy()
+    x[:3] = np.nan
+    x[-4:] = np.nan
+    x[90:92] = np.nan
+    time = 2002 + (np.arange(300)+0.5)/12
+    result = process_series(time,x,extrapolate=True,validate_endpoints=True,
+                            window=48,rank=6,two_stage=False,tolerance=1e-6)
+    values, flags, status, _, _, _, backward, forward = result
+    assert status == 1 and np.isfinite(values).all()
+    assert (flags[:3] == 4).all() and (flags[-4:] == 5).all()
+    np.testing.assert_array_equal(values[np.isfinite(x)],x[np.isfinite(x)])
+    assert np.max(np.abs(values[:3]-truth[:3])) < 0.02
+    assert np.max(np.abs(values[-4:]-truth[-4:])) < 0.02
+    assert backward < 0.02 and forward < 0.02
+    # Changing withheld observations must not affect their predictions.
+    # process_series' diagnostic equals a separate raw-data holdout refit.
+    raw = x[3:-4]
+    trial = raw.copy()
+    trial[-4:] = np.nan
+    independent = ssa_fill(trial,48,6,tolerance=1e-6)
+    expected = np.sqrt(np.mean((independent.values[-4:]-raw[-4:])**2))
+    np.testing.assert_allclose(forward,expected)
+
+
+def test_endpoint_limits_masks_and_nonconvergence():
+    time = 2002 + (np.arange(300)+0.5)/12
+    x = signal(300)
+    x[:20] = np.nan
+    x[-4:] = np.nan
+    result = process_series(time,x,extrapolate=True,max_extrapolation=4,
+                            window=48,rank=5,two_stage=False,tolerance=1e-6)
+    assert np.isnan(result[0][:20]).all()
+    assert (result[1][-4:] == 5).all() and result[2] == 2
+    result = process_series(time,np.full(300,np.nan),extrapolate=True)
+    assert np.isnan(result[0]).all() and (result[1] == 3).all()
+    x[:20] = signal(300)[:20]
+    result = process_series(time,x,extrapolate=True,window=48,rank=5,
+                            two_stage=False,max_iterations=1)
+    assert np.isnan(result[0][-4:]).all() and result[2] == 5
+
+
+def test_endpoint_netcdf_cli(tmp_path):
+    x = signal(300)
+    x[:3] = np.nan
+    x[-4:] = np.nan
+    ds = xr.Dataset({'lwe_thickness':(('time','mascon'),x[:,None],{'Units':'cm'})},
+                    coords={'time':xr.date_range('2002-01-01',periods=300,freq='MS'),
+                            'mascon':[1]})
+    source, destination = tmp_path/'endpoint.nc',tmp_path/'endpoint_filled.nc'
+    ds.to_netcdf(source)
+    result = subprocess.run([sys.executable,str(Path(__file__).with_name('ssa_gapfill.py')),
+        str(source),str(destination),'--variable','lwe_thickness','--extrapolate',
+        '--validate-endpoints','--window','48','--rank','5','--single-stage',
+        '--tolerance','0.000001'],capture_output=True,text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    with xr.open_dataset(destination) as out:
+        assert np.isfinite(out.lwe_thickness_ssa.values).all()
+        assert (out.lwe_thickness_ssa_flag.values[:3] == 4).all()
+        assert (out.lwe_thickness_ssa_flag.values[-4:] == 5).all()
+        assert out.lwe_thickness_ssa_forward_holdout_rmse.item() < 0.01
+        assert out.lwe_thickness_ssa_backward_holdout_rmse.item() < 0.01
+        assert np.isnan(out.lwe_thickness.values[:3]).all()

@@ -186,6 +186,70 @@ def fill_series(time, x, window=60, rank=10, two_stage=True,
     return output, flags, np.int8(status), np.int16(window), np.int16(rank), score
 
 
+def process_series(time, x, extrapolate=False, max_extrapolation=12,
+                   validate_endpoints=False, **options):
+    """Optional iterative low-rank SSA completion of leading/trailing gaps.
+
+    Returns the six fill_series outputs plus backward/forward holdout RMSE.
+    Extrapolated values are estimates, flagged 4 (backward) or 5 (forward).
+    Holdout diagnostics refit raw data without the withheld endpoint samples.
+    """
+    values, flags, status, m, k, score = fill_series(time, x, **options)
+    errors = [np.nan, np.nan]
+    raw = np.asarray(x, dtype=float)
+    known = np.flatnonzero(np.isfinite(raw))
+    if not extrapolate or known.size < options.get('min_observations', 24):
+        return values, flags, status, m, k, score, *errors
+    start, stop = int(known[0]), int(known[-1])+1
+    left, right = start, len(raw)-stop
+    if not (left or right) or not np.isfinite(values[start:stop]).all():
+        return values, flags, status, m, k, score, *errors
+    window = int(m) if m else options.get('window', 60)
+    rank = int(k) if k else options.get('rank', 10)
+    solver = dict(tolerance=options.get('tolerance', 0.01),
+                  max_iterations=options.get('max_iterations', 10000))
+    # Each side is bounded independently; long masked margins remain missing.
+    extend_left = left if left <= max_extrapolation else 0
+    extend_right = right if right <= max_extrapolation else 0
+    if not (extend_left or extend_right):
+        return values, flags, status, m, k, score, *errors
+    a, b = start-extend_left, stop+extend_right
+    if window > b-a or rank > min(window, b-a-window+1):
+        return values, flags, np.int8(2), m, k, score, *errors
+    fit = ssa_fill(values[a:b], window, rank, **solver)
+    if not fit.converged:
+        return values, flags, np.int8(5), m, k, score, *errors
+    if extend_left:
+        values[:start] = fit.values[:extend_left]
+        flags[:start] = 4
+    if extend_right:
+        values[stop:] = fit.values[-extend_right:]
+        flags[stop:] = 5
+    status = np.int8(2 if np.any(flags == 3) else 1)
+    if validate_endpoints:
+        # Independent tests: withhold h calendar months from either end of
+        # the original observed span. Score only measured holdout values.
+        segment = raw[start:stop]
+        for side, horizon in enumerate((extend_left, extend_right)):
+            if not horizon:
+                continue
+            mask = np.zeros(len(segment), dtype=bool)
+            mask[:horizon] = side == 0
+            if side == 1:
+                mask[-horizon:] = True
+            scored = mask & np.isfinite(segment)
+            trial = segment.copy()
+            trial[mask] = np.nan
+            if np.isfinite(trial).sum() < options.get('min_observations', 24):
+                continue
+            if window > len(trial) or rank > min(window, len(trial)-window+1):
+                continue
+            check = ssa_fill(trial, window, rank, **solver)
+            if check.converged and scored.any():
+                errors[side] = float(np.sqrt(np.mean((check.values[scored]-segment[scored])**2)))
+    return values, flags, status, m, k, score, *errors
+
+
 def monthly_axis(ds, time_name, regularize=False):
     """Validate monthly sampling; optionally insert absent calendar months.
 
@@ -258,15 +322,18 @@ def run_netcdf(args):
         options = dict(window=args.window, rank=args.rank, two_stage=not args.single_stage,
                        stage_a_window=args.stage_a_window, stage_a_rank=args.stage_a_rank,
                        min_observations=args.min_observations, cv=args.cv,
-                       tolerance=args.tolerance, max_iterations=args.max_iterations)
-        values, flags, status, m, k, rmse = xr.apply_ufunc(
-            fill_series, time, data,
+                       tolerance=args.tolerance, max_iterations=args.max_iterations,
+                       extrapolate=args.extrapolate, max_extrapolation=args.max_extrapolation,
+                       validate_endpoints=args.validate_endpoints)
+        values, flags, status, m, k, rmse, backward_rmse, forward_rmse = xr.apply_ufunc(
+            process_series, time, data,
             input_core_dims=[[args.time], [args.time]],
-            output_core_dims=[[args.time], [args.time], [], [], [], []],
+            output_core_dims=[[args.time], [args.time], [], [], [], [], [], []],
             vectorize=True, dask='parallelized', kwargs=options,
-            output_dtypes=[np.float64, np.int8, np.int8, np.int16, np.int16, np.float64])
+            output_dtypes=[np.float64, np.int8, np.int8, np.int16, np.int16, np.float64, np.float64, np.float64])
         prefix = args.variable + '_ssa'
-        names = [prefix, prefix+'_flag', prefix+'_status', prefix+'_window', prefix+'_rank', prefix+'_cv_rmse']
+        names = [prefix, prefix+'_flag', prefix+'_status', prefix+'_window', prefix+'_rank', prefix+'_cv_rmse',
+                 prefix+'_backward_holdout_rmse', prefix+'_forward_holdout_rmse']
         if any(name in ds.variables for name in names):
             raise ValueError('Output SSA variable names already exist in the input')
         out = ds.copy()
@@ -279,18 +346,25 @@ def run_netcdf(args):
             ssa_tolerance=args.tolerance, ssa_max_iterations=args.max_iterations,
             ssa_stage_a_window=args.stage_a_window, ssa_stage_a_rank=args.stage_a_rank,
             ssa_min_observations=args.min_observations,
-            comment='Only missing interior values are filled; observed samples are preserved. See flags/status.')
+            ssa_extrapolate=int(args.extrapolate), ssa_max_extrapolation=args.max_extrapolation,
+            ssa_validate_endpoints=int(args.validate_endpoints),
+            comment='Observed samples preserved. Flags 4/5 are endpoint estimates, not observations; inspect holdout diagnostics.')
         out[names[1]] = flags.transpose(*data.dims)
-        out[names[1]].attrs.update(flag_values=np.arange(4,dtype=np.int8),
-            flag_meanings='observed filled_stage_a filled_stage_b unfilled')
+        out[names[1]].attrs.update(flag_values=np.arange(6,dtype=np.int8),
+            flag_meanings='observed filled_stage_a filled_stage_b unfilled backward_extrapolation forward_extrapolation')
         out[names[2]] = status
-        out[names[2]].attrs.update(flag_values=np.arange(5,dtype=np.int8),
-            flag_meanings='no_gaps success insufficient_data nonconvergence no_cv_candidate')
+        out[names[2]].attrs.update(flag_values=np.arange(6,dtype=np.int8),
+            flag_meanings='no_gaps success insufficient_data nonconvergence no_cv_candidate endpoint_nonconvergence')
         out[names[3]], out[names[4]], out[names[5]] = m, k, rmse
         out[names[3]].attrs['long_name'] = 'Stage B SSA window (0 if not selected)'
         out[names[4]].attrs['long_name'] = 'Stage B SSA rank (0 if not selected)'
         out[names[5]].attrs.update(long_name='Blocked-year cross-validation RMSE; NaN when not run',
                                    units=ds[args.variable].attrs.get('units',ds[args.variable].attrs.get('Units','')))
+        for name, diagnostic, direction in zip(names[6:], [backward_rmse, forward_rmse], ['Backward','Forward']):
+            out[name] = diagnostic
+            out[name].attrs.update(long_name=f'{direction} endpoint holdout RMSE',
+                units=ds[args.variable].attrs.get('units',ds[args.variable].attrs.get('Units','')),
+                comment='Single-stage SSA refit withholding the same number of endpoint calendar months as extrapolated. NaN means not run or unavailable. Not a confidence interval.')
         history = ds.attrs.get('history', '')
         out.attrs['history'] = history + '\n' + datetime.now(timezone.utc).isoformat() + ' SSA gap filling; original variable retained'
         if subset:
@@ -321,7 +395,7 @@ def run_netcdf(args):
         counts = check[names[2]].values
         unique, number = np.unique(counts, return_counts=True)
         print('Series status counts:', dict(zip(unique.tolist(), number.tolist())))
-        print('0=no gaps, 1=success, 2=insufficient data/endpoints, 3=nonconvergence, 4=CV failure')
+        print('0=no gaps, 1=success, 2=insufficient data/endpoints, 3=nonconvergence, 4=CV failure, 5=endpoint nonconvergence')
 
 
 def main():
@@ -336,6 +410,9 @@ def main():
     p.add_argument('--stage-a-rank', type=int, default=10)
     p.add_argument('--single-stage', action='store_true')
     p.add_argument('--cv', action='store_true', help='Expensive per-series blocked-year parameter selection')
+    p.add_argument('--extrapolate', action='store_true', help='Estimate leading/trailing NaNs using iterative SSA; flags 4/5')
+    p.add_argument('--max-extrapolation', type=int, default=12, help='Maximum endpoint gap per side in months (default 12)')
+    p.add_argument('--validate-endpoints', action='store_true', help='With --extrapolate, save independent endpoint holdout RMSE diagnostics')
     p.add_argument('--regularize-months', action='store_true', help='Normalize dates to month start and insert absent months across the dataset')
     p.add_argument('--missing-below', type=float, help='Also treat selected-variable values <= this threshold as missing')
     p.add_argument('--min-observations', type=int, default=24)
@@ -346,6 +423,10 @@ def main():
     p.add_argument('--isel', action='append', default=[], metavar='DIM=START:STOP',
                    help='Process only an index subset; repeat for multiple spatial dimensions (stop excluded)')
     args = p.parse_args()
+    if args.max_extrapolation < 1:
+        p.error('max-extrapolation must be positive')
+    if args.validate_endpoints and not args.extrapolate:
+        p.error('--validate-endpoints requires --extrapolate')
     if args.workers < 1 or args.spatial_chunk < 1 or args.min_observations < 2:
         p.error('workers/chunks must be positive and min-observations >= 2')
     if args.window < 2 or args.rank < 1 or args.rank > args.window:
